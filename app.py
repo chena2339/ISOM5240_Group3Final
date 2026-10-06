@@ -26,8 +26,8 @@ import streamlit as st
 # TODO: after pushing your fine-tuned models to the Hub (see the two fine-tuning
 # notebooks), replace the two ids below. Course rule: the models used here must be
 # exactly the models produced by your notebooks.
-SENTIMENT_MODEL_ID = "<your-username>/finbert-fx-sentiment"   # Student A - Model 1
-SUMMARY_MODEL_ID   = "<your-username>/t5-fx-briefing"         # Student B - Model 2
+SENTIMENT_MODEL_ID = "chena2339/finbert-fx-sentiment"   # Student A - Model 1
+SUMMARY_MODEL_ID   = "chena2339/t5-fx-briefing"         # Student B - Model 2
 CHRONOS_MODEL_ID   = "amazon/chronos-bolt-small"              # pre-trained, NOT fine-tuned
 
 FX_PAIRS = {
