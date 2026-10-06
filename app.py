@@ -133,27 +133,36 @@ def load_summary_model(model_id: str):
 # Model inference helpers
 # ---------------------------------------------------------------------------
 def chronos_forecast(pipe, history: pd.Series, days: int = FORECAST_DAYS):
-    """7-day forecast for one series. Returns (median, p10, p90) numpy arrays."""
+    """7-day forecast. Returns (median, p10, p90). Never calls Chronos twice on failure."""
     import torch
 
-    context = torch.tensor(history.tail(120).to_numpy(dtype=np.float32))
+    values = pd.to_numeric(history, errors="coerce").dropna().to_numpy(dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        raise ValueError("No closes available for Chronos.")
+    last_spot = float(values[-1])
+
+    # Bolt patch size is 16. Left-pad with NaN so unfold always sees a full patch.
+    min_length = 32
+    if values.size < min_length:
+        pad = np.full(min_length - values.size, np.nan, dtype=np.float32)
+        values = np.concatenate([pad, values])
+    context = torch.tensor(values, dtype=torch.float32).unsqueeze(0)  # (1, time)
+
     try:
         quantiles, _ = pipe.predict_quantiles(
-            [context], prediction_length=days, quantile_levels=[0.1, 0.5, 0.9])
-        q = quantiles[0].detach().cpu().numpy()          # expected shape (days, 3)
-        median, p10, p90 = q[:, 1], q[:, 0], q[:, 2]
-    except Exception:
-        # Fallback path: works for both Chronos variants. Bolt returns its 9 fixed
-        # quantile levels, classic Chronos returns sample trajectories - either way
-        # the array is (K, days) and we reduce across axis 0.
-        out = pipe.predict([context], prediction_length=days)
-        arr = out[0].detach().cpu().numpy()
-        median, p10, p90 = np.median(arr, 0), np.quantile(arr, 0.1, 0), np.quantile(arr, 0.9, 0)
+            context, prediction_length=days, quantile_levels=[0.1, 0.5, 0.9]
+        )
+        q = quantiles[0].detach().float().cpu().numpy()  # (days, 3): p10, p50, p90
+        p10, median, p90 = q[:, 0], q[:, 1], q[:, 2]
+    except Exception as exc:
+        st.warning(f"Chronos fallback used ({type(exc).__name__}).")
+        drift = float(np.log(values[-1] / values[-2])) if np.isfinite(values[-2]) else 0.0
+        steps = np.arange(1, days + 1)
+        median = last_spot * np.exp(drift * steps)
+        p10, p90 = median * 0.99, median * 1.01
 
-    last_spot = float(history.iloc[-1])
-    # NaN safety: fall back to the last observed spot rate.
-    nan_fill = lambda a: np.nan_to_num(a, nan=last_spot)
-    return nan_fill(median), nan_fill(p10), nan_fill(p90)
+    fill = lambda a: np.nan_to_num(np.asarray(a, dtype=float), nan=last_spot)
+    return fill(median), fill(p10), fill(p90)
 
 
 def score_headlines(clf, headlines: list):
