@@ -1,0 +1,17 @@
+# CPU-only PyTorch wheels: much smaller download, Streamlit Cloud has no GPU.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit>=1.36
+pandas
+numpy
+plotly
+yfinance
+feedparser
+# Pinned majors: chronos-forecasting 2.x changed the predict_quantiles API, and
+# transformers 5.x changed pipeline arguments - the app targets the 1.x / 4.x APIs.
+chronos-forecasting>=1.4,<2.0
+transformers>=4.44,<5.0
+accelerate
+sentencepiece
+gspread
+torch
