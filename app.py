@@ -73,9 +73,9 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
         if df is None or df.empty:
             raise ValueError("Empty dataframe returned from yfinance")
             
-     close = df["Close"]
-if isinstance(close, pd.DataFrame):      # handle 1-column DataFrame returned by some yfinance versions
-    close = close.iloc[:, 0]
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):      # handle 1-column DataFrame returned by some yfinance versions
+            close = close.iloc[:, 0]
         close = close.dropna()
         if len(close) == 0:
             raise ValueError("No valid close prices after dropping NaNs")
