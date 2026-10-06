@@ -306,7 +306,7 @@ if not selected_pairs:
     st.stop()
 
 for label, mid in [("Sentiment", sentiment_id), ("Briefing", summary_id)]:
-    if "<your-username>" in mid:
+    if "<chena2339>" in mid:
         st.error(f"{label} model id is still a placeholder. Fine-tune the model with the "
                  "corresponding notebook, push it to the Hugging Face Hub, then paste your "
                  "model id in the sidebar (or edit the constants at the top of app.py).")
