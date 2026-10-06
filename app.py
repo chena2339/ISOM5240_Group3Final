@@ -65,7 +65,7 @@ st.set_page_config(page_title="FX Treasury Copilot", layout="wide")
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
-    """Download daily closes with multi-source fallback (yfinance -> free API -> static default)."""
+    """Download daily closes with multi-source fallback (yfinance -> Frankfurter API -> static default)."""
     import yfinance as yf
     import requests
 
@@ -83,19 +83,29 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
     except Exception:
         pass
 
-    # 2. Secondary Source: Free open.er-api.com (No API key required)
+    # 2. Secondary Source: Free Frankfurter Historical API (No API key required)
     try:
-        base_curr = ticker[:3]  # e.g. "EUR" from "EURUSD=X"
-        url = f"https://open.er-api.com/v6/latest/{base_curr}"
-        resp = requests.get(url, timeout=5).json()
-        if resp.get("result") == "success":
-            rate = resp["rates"]["USD"]
-            dates = pd.date_range(end=pd.Timestamp.now(), periods=90, freq="D")
-            return pd.Series(rate, index=dates)
+        # e.g., ticker "EURUSD=X" -> base="EUR", quote="USD"
+        base_curr = ticker[:3]
+        quote_curr = ticker[3:6]
+        
+        # Fetch last 30 days of real daily historical rates
+        url = f"https://api.frankfurter.app/latest?amount=1&from={base_curr}&to={quote_curr}"
+        # For full history window:
+        start_date = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
+        url_hist = f"https://api.frankfurter.app/{start_date}..?from={base_curr}&to={quote_curr}"
+        
+        resp = requests.get(url_hist, timeout=5).json()
+        rates = resp.get("rates", {})
+        if rates:
+            data = {pd.to_datetime(dt): val[quote_curr] for dt, val in rates.items()}
+            s = pd.Series(data).sort_index()
+            if len(s) > 0:
+                return s
     except Exception:
         pass
 
-    # 3. Final Fallback: Static defaults if all network calls fail
+    # 3. Final Fallback: Static baseline defaults
     defaults = {
         "EURUSD=X": 1.0850,
         "GBPUSD=X": 1.2700,
