@@ -354,8 +354,19 @@ if not histories:
     st.stop()
 
 st.subheader("Market snapshot - last 5 daily closes")
-snapshot = pd.DataFrame({p: h.tail(5) for p, h in histories.items()}).round(4)
-st.dataframe(snapshot, use_container_width=True)
+
+# Extract the latest 5 daily closes and align them by date
+history_data = {}
+for pair, ticker in FX_PAIRS.items():
+    s = load_fx_history(ticker, period="10d")
+    # Convert index to date-only to fix outer-join issues caused by time components
+    s.index = s.index.date
+    # Deduplicate keeping the last price per day, then select the latest 5 trading days
+    history_data[pair] = s.groupby(s.index).last().tail(5)
+
+# Combine into a DataFrame for display
+snapshot_df = pd.DataFrame(history_data)
+st.dataframe(snapshot_df, use_container_width=True)
 
 vol_display = {t: (f"{v:.2f}" if v is not None else "n/a") for t, v in vol_vals.items()}
 st.caption("Volatility indices (baseline): " +
