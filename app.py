@@ -1,132 +1,426 @@
-"""HSBC 7-day FX conversion screen for ISOM5240.
+"""
+FX Treasury Copilot - 7-day dynamic FX projection for corporate cash-flow management.
 
-Pipeline A: fine-tuned FinBERT text classifier (appreciation / depreciation / neutral).
-Pipeline B: fine-tuned DistilBERT event classifier
-(central_bank / inflation_print / jobs_data / no_macro_event).
+Hugging Face pipelines used (course requirement: at least two):
+  1. text-classification : fine-tuned sentiment model          (Student A, Model 1)
+  2. summarization       : fine-tuned news-briefing model       (Student B, Model 2)
+  3. time-series forecast: amazon/chronos-bolt-small            (pre-trained, zero-shot)
 
-Both pipelines must load the weights produced by the Colab notebooks.
-A base checkpoint is not a silent substitute: the course penalizes a mismatch
-between the fine-tuned file and the Streamlit model.
+Business logic layers on top of the model forecast:
+  - Live market anchoring  : latest 5 daily closes from yfinance
+  - Volatility adjustment  : ^VIX (20), ^V2TX (20), ^VFTSE (15) and Eurozone ESI (100)
+  - Macro event simulation : +0.2% volatility from day 2 for EUR, GBP, INR
+  - Weekend transaction fee: x0.995 on Saturday/Sunday projections (HSBC alignment)
+  - Execution advice       : best / worst day to convert, given the trade direction
+
+Run locally:  streamlit run app.py
 """
 
-from __future__ import annotations
-
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from fx_engine import (
-    fetch_market_anchor,
-    fetch_vol_indices,
-    project_seven_days,
-    recommend,
-)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# TODO: after pushing your fine-tuned models to the Hub (see the two fine-tuning
+# notebooks), replace the two ids below. Course rule: the models used here must be
+# exactly the models produced by your notebooks.
+SENTIMENT_MODEL_ID = "<your-username>/finbert-fx-sentiment"   # Student A - Model 1
+SUMMARY_MODEL_ID   = "<your-username>/t5-fx-briefing"         # Student B - Model 2
+CHRONOS_MODEL_ID   = "amazon/chronos-bolt-small"              # pre-trained, NOT fine-tuned
 
-APP_DIR = Path(__file__).resolve().parent
-MODEL_A = APP_DIR / "models" / "finbert_fx_direction"
-MODEL_B = APP_DIR / "models" / "distilbert_macro_event"
-DIRECTION_LABELS = ["appreciation", "depreciation", "neutral"]
-EVENT_LABELS = ["central_bank", "inflation_print", "jobs_data", "no_macro_event"]
-
-SAMPLE_HEADLINES = {
-    "EUR": "Dealers mark EUR stronger versus USD into the London fix. CPI is scheduled and EUR dealers cut risk into the print.",
-    "GBP": "Sterling slips versus the dollar as offshore funding tightens. Traders reprice sterling before the central bank rate decision.",
-    "HKD": "The Hong Kong dollar stays inside the convertibility band versus USD. No scheduled macro release is driving Hong Kong dollar this session.",
-    "INR": "Stop-loss selling extends the INR decline against USD. Labour-market figures are ahead and Indian rupee flow turns cautious.",
+FX_PAIRS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "HKD/USD": "HKDUSD=X",
+    "INR/USD": "INRUSD=X",
 }
 
+# Volatility indices and their neutral baselines.
+VOL_BENCHMARKS = {"^VIX": 20.0, "^V2TX": 20.0, "^VFTSE": 15.0}
+ESI_BASELINE = 100.0  # Eurozone Economic Sentiment Indicator, long-run average = 100
 
-@st.cache_resource(show_spinner="Loading fine-tuned pipelines")
-def load_pipelines(path_a: str, path_b: str):
+# Google News RSS queries used to collect pair-specific headlines (no API key needed).
+NEWS_QUERIES = {
+    "EUR/USD": "euro dollar ECB exchange rate",
+    "GBP/USD": "pound sterling dollar Bank of England",
+    "HKD/USD": "Hong Kong dollar peg HKMA",
+    "INR/USD": "rupee dollar RBI exchange rate",
+}
+
+FORECAST_DAYS   = 7
+WEEKEND_FACTOR  = 0.995   # assumed 0.5% weekend transaction fee
+EVENT_SPIKE     = 0.002   # +0.2% volatility spike for the macro-event simulation
+EVENT_PAIRS     = {"EUR/USD", "GBP/USD", "INR/USD"}   # HKD is pegged -> excluded
+SENTIMENT_WEIGHT = 0.0015  # max ~ +/-0.15% daily drift from news sentiment
+VOL_WEIGHT       = 0.0005  # daily drift per relative volatility-index deviation
+ESI_WEIGHT       = 0.0005  # EUR-specific daily drift per relative ESI deviation
+
+st.set_page_config(page_title="FX Treasury Copilot", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Data loaders (cached)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
+    """Download daily closes for one ticker and return a clean, tz-naive Series."""
+    import yfinance as yf
+
+    df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):      # some yfinance versions return a 1-col DataFrame
+        close = close.iloc[:, 0]
+    close = close.dropna()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    return close
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_vol_indices() -> dict:
+    """Latest close of each volatility index; missing indices are returned as None."""
+    values = {}
+    for ticker in VOL_BENCHMARKS:
+        try:
+            s = load_fx_history(ticker, period="5d")
+            values[ticker] = float(s.iloc[-1]) if len(s) else None
+        except Exception:
+            values[ticker] = None
+    return values
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_headlines(query: str, n: int) -> list:
+    """Latest headlines from Google News RSS for one query."""
+    import urllib.parse
+
+    import feedparser
+
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(query) + "&hl=en-US&gl=US&ceid=US:en")
+    feed = feedparser.parse(url)
+    return [e.title for e in feed.entries[:n]]
+
+
+# ---------------------------------------------------------------------------
+# Hugging Face pipelines (cached resources -> loaded once per session)
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading the forecasting model (Chronos-Bolt) ...")
+def load_forecaster():
+    from chronos import BaseChronosPipeline
+
+    return BaseChronosPipeline.from_pretrained(CHRONOS_MODEL_ID, device_map="cpu")
+
+
+@st.cache_resource(show_spinner="Loading the fine-tuned sentiment model ...")
+def load_sentiment_model(model_id: str):
     from transformers import pipeline
 
-    direction = pipeline("text-classification", model=path_a, tokenizer=path_a)
-    event = pipeline("text-classification", model=path_b, tokenizer=path_b)
-    return direction, event
+    # HF pipeline #1: fine-tuned by Student A.
+    return pipeline("text-classification", model=model_id, truncation=True, max_length=128)
 
 
-def score_headline(pipe, text: str) -> tuple[str, float]:
-    # Truncate to the model context. FinBERT and DistilBERT both use 512 tokens.
-    result = pipe(text[:1500], truncation=True, top_k=1)
-    row = result[0] if isinstance(result, list) else result
-    return str(row["label"]).lower(), float(row["score"])
+@st.cache_resource(show_spinner="Loading the fine-tuned briefing model ...")
+def load_summary_model(model_id: str):
+    from transformers import pipeline
+
+    # HF pipeline #2: fine-tuned by Student B.
+    return pipeline("summarization", model=model_id)
 
 
-def main() -> None:
-    st.set_page_config(page_title="HSBC FX 7-day screen", layout="wide")
-    st.title("HSBC corporate FX conversion screen")
-    st.caption("Company: HSBC · https://www.hsbc.com.hk · Two Hugging Face pipelines, then a 7-day path.")
+# ---------------------------------------------------------------------------
+# Model inference helpers
+# ---------------------------------------------------------------------------
+def chronos_forecast(pipe, history: pd.Series, days: int = FORECAST_DAYS):
+    """7-day forecast for one series. Returns (median, p10, p90) numpy arrays."""
+    import torch
 
-    with st.sidebar:
-        st.header("Model folders")
-        path_a = st.text_input("Pipeline A folder", str(MODEL_A))
-        path_b = st.text_input("Pipeline B folder", str(MODEL_B))
-        esi = st.number_input("Eurozone ESI (manual, baseline 100)", value=100.0, step=0.5)
-        side = st.selectbox(
-            "Conversion side",
-            options=["sell_fc", "buy_fc"],
-            format_func=lambda x: "Sell foreign currency for USD" if x == "sell_fc" else "Buy foreign currency with USD",
-        )
-        st.caption("Weekend rows use an assumed 0.5% conversion cost (x0.995). Weekdays do not.")
+    context = torch.tensor(history.tail(120).to_numpy(dtype=np.float32))
+    try:
+        quantiles, _ = pipe.predict_quantiles(
+            [context], prediction_length=days, quantile_levels=[0.1, 0.5, 0.9])
+        q = quantiles[0].detach().cpu().numpy()          # expected shape (days, 3)
+        median, p10, p90 = q[:, 1], q[:, 0], q[:, 2]
+    except Exception:
+        # Fallback path: works for both Chronos variants. Bolt returns its 9 fixed
+        # quantile levels, classic Chronos returns sample trajectories - either way
+        # the array is (K, days) and we reduce across axis 0.
+        out = pipe.predict([context], prediction_length=days)
+        arr = out[0].detach().cpu().numpy()
+        median, p10, p90 = np.median(arr, 0), np.quantile(arr, 0.1, 0), np.quantile(arr, 0.9, 0)
 
-    missing = [p for p in (path_a, path_b) if not Path(p).exists()]
-    if missing:
-        st.error(
-            "Fine-tuned model folder not found. Run the Colab notebooks and copy the saved "
-            "folders to GitHub_App_Files/models before deploying. Missing: " + ", ".join(missing)
-        )
+    last_spot = float(history.iloc[-1])
+    # NaN safety: fall back to the last observed spot rate.
+    nan_fill = lambda a: np.nan_to_num(a, nan=last_spot)
+    return nan_fill(median), nan_fill(p10), nan_fill(p90)
+
+
+def score_headlines(clf, headlines: list):
+    """Score headlines with the fine-tuned sentiment model.
+
+    Returns (signed_score, label_counts, detail_rows):
+      signed_score in [-1, 1] = mean( P(positive) - P(negative) ) over all headlines.
+    """
+    if not headlines:
+        return 0.0, {"POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0}, []
+    dists = clf(headlines, top_k=None, batch_size=16)    # full 3-class distribution
+    signed, counts, rows = [], {"POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0}, []
+    for headline, dist in zip(headlines, dists):
+        d = {x["label"].upper(): x["score"] for x in dist}
+        signed.append(d.get("POSITIVE", 0.0) - d.get("NEGATIVE", 0.0))
+        top = max(dist, key=lambda x: x["score"])
+        counts[top["label"].upper()] += 1
+        rows.append({"Headline": headline,
+                     "Sentiment": top["label"].title(),
+                     "Confidence": round(float(top["score"]), 3)})
+    return float(np.mean(signed)), counts, rows
+
+
+def generate_briefing(summarizer, headlines: list, max_items: int = 8) -> str:
+    """Compress the top headlines into one executive briefing (T5-small, fine-tuned)."""
+    if not headlines:
+        return "No headlines available."
+    text = " ".join(headlines[:max_items])[:3000]        # stay inside the 512-token window
+    return summarizer(text, max_length=64, min_length=15)[0]["summary_text"]
+
+
+# ---------------------------------------------------------------------------
+# Business logic
+# ---------------------------------------------------------------------------
+def compute_daily_vol_adjustment(pair: str, vol_vals: dict, esi: float) -> float:
+    """Daily drift adjustment (decimal, e.g. 0.001 = +0.1%/day) from vol indices and ESI.
+
+    Sign convention: pairs are quoted XXX/USD, so risk-off (index above baseline)
+    strengthens the dollar and pushes the pair DOWN.
+    """
+    adj = 0.0
+    vix = vol_vals.get("^VIX")
+    if vix is not None:                                   # global risk sentiment -> all pairs
+        adj += -VOL_WEIGHT * (vix - VOL_BENCHMARKS["^VIX"]) / VOL_BENCHMARKS["^VIX"]
+    if pair == "EUR/USD":
+        v2tx = vol_vals.get("^V2TX")
+        if v2tx is not None:
+            adj += -VOL_WEIGHT * (v2tx - VOL_BENCHMARKS["^V2TX"]) / VOL_BENCHMARKS["^V2TX"]
+        adj += ESI_WEIGHT * (esi - ESI_BASELINE) / ESI_BASELINE   # eurozone sentiment
+    elif pair == "GBP/USD":
+        vftse = vol_vals.get("^VFTSE")
+        if vftse is not None:
+            adj += -VOL_WEIGHT * (vftse - VOL_BENCHMARKS["^VFTSE"]) / VOL_BENCHMARKS["^VFTSE"]
+    elif pair == "HKD/USD":
+        adj *= 0.2   # HKD is pegged to USD; global risk sentiment barely moves it
+    return adj
+
+
+def build_projection(history, median, p10, p90, sentiment_score, daily_vol_adj,
+                     pair, event_on, weekend_fee_on, seed=7) -> pd.DataFrame:
+    """Apply the corporate-finance rules on top of the raw model forecast."""
+    dates = pd.date_range(history.index[-1] + pd.Timedelta(days=1),
+                          periods=FORECAST_DAYS, freq="D")
+    rng = np.random.default_rng(seed)   # fixed seed -> reproducible event simulation
+
+    rows, cum_adj = [], 0.0
+    for t in range(FORECAST_DAYS):
+        day_no = t + 1
+        # 1) news-sentiment drift, decaying over the horizon
+        cum_adj += SENTIMENT_WEIGHT * sentiment_score * (0.9 ** t)
+        # 2) volatility-index / ESI drift
+        cum_adj += daily_vol_adj
+        # 3) macro-event simulation: +0.2% volatility from day 2 (EUR, GBP, INR only)
+        band_widen = 0.0
+        if event_on and pair in EVENT_PAIRS and day_no >= 2:
+            band_widen = EVENT_SPIKE
+            cum_adj += rng.normal(0.0, EVENT_SPIKE / 4)   # small zero-mean event noise
+
+        rate = median[t] * (1 + cum_adj)
+        low = p10[t] * (1 + cum_adj) * (1 - band_widen)
+        high = p90[t] * (1 + cum_adj) * (1 + band_widen)
+
+        # 4) weekend transaction fee (HSBC alignment): 0.5% off on Sat/Sun
+        note = ""
+        if weekend_fee_on and dates[t].weekday() >= 5:
+            rate, low, high = rate * WEEKEND_FACTOR, low * WEEKEND_FACTOR, high * WEEKEND_FACTOR
+            note = "Weekend fee applied"
+
+        rows.append({"Date": dates[t].date(), pair: round(float(rate), 4),
+                     "Low (P10)": round(float(low), 4),
+                     "High (P90)": round(float(high), 4), "Note": note})
+    return pd.DataFrame(rows)
+
+
+def recommend_days(proj: pd.DataFrame, pair: str, direction: str):
+    """Best / avoid execution day given the trade direction; weekends excluded (fee)."""
+    weekday_mask = ~pd.to_datetime(proj["Date"]).dt.weekday.isin([5, 6])
+    tradable = proj[weekday_mask] if weekday_mask.any() else proj
+    if direction.startswith("Buy"):      # buying foreign currency -> want the pair LOW
+        return (tradable.loc[tradable[pair].idxmin()],
+                tradable.loc[tradable[pair].idxmax()])
+    return (tradable.loc[tradable[pair].idxmax()],   # selling -> want the pair HIGH
+            tradable.loc[tradable[pair].idxmin()])
+
+
+def upload_to_gsheet(df: pd.DataFrame, sheet_url: str, tab: str):
+    """Upload the projection matrix to a Google Sheet tab.
+
+    Requires a service-account key stored in .streamlit/secrets.toml as
+    [gcp_service_account]. The Sheet must be shared with the service-account email.
+    """
+    import gspread
+
+    creds = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(creds)
+    ws = gc.open_by_url(sheet_url).worksheet(tab)
+    ws.clear()
+    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+st.title("FX Treasury Copilot")
+st.caption("7-day dynamic FX projection for corporate cash-flow management - "
+           "deep-learning forecast + fine-tuned news sentiment + executive briefings.")
+
+with st.sidebar:
+    st.header("Settings")
+    sentiment_id = st.text_input("Sentiment model id (Hugging Face)", SENTIMENT_MODEL_ID)
+    summary_id = st.text_input("Briefing model id (Hugging Face)", SUMMARY_MODEL_ID)
+    selected_pairs = st.multiselect("Currency pairs", list(FX_PAIRS),
+                                    default=["EUR/USD", "GBP/USD"])
+    direction = st.radio("Your cash-flow position",
+                         ["Buy foreign currency with USD (accounts payable)",
+                          "Sell foreign currency for USD (accounts receivable)"])
+    esi = st.slider("Eurozone ESI (baseline 100)", 90.0, 110.0, 100.0, 0.1,
+                    help="Economic Sentiment Indicator, published monthly by the EU Commission.")
+    event_on = st.checkbox("Macro event risk next week (+0.2% vol from day 2)", value=True)
+    weekend_fee_on = st.checkbox("Apply 0.5% weekend transaction fee", value=True)
+    n_headlines = st.slider("Headlines per pair", 5, 20, 10)
+    st.divider()
+    with st.expander("Google Sheets upload (optional)"):
+        gs_enable = st.checkbox("Upload projection to Google Sheet", value=False)
+        gs_url = st.text_input("Sheet URL")
+        gs_tab = st.text_input("Tab name", value="FX_Projection")
+
+if not selected_pairs:
+    st.warning("Select at least one currency pair in the sidebar.")
+    st.stop()
+
+for label, mid in [("Sentiment", sentiment_id), ("Briefing", summary_id)]:
+    if "<your-username>" in mid:
+        st.error(f"{label} model id is still a placeholder. Fine-tune the model with the "
+                 "corresponding notebook, push it to the Hugging Face Hub, then paste your "
+                 "model id in the sidebar (or edit the constants at the top of app.py).")
         st.stop()
 
-    direction_pipe, event_pipe = load_pipelines(path_a, path_b)
-    st.subheader("Headlines scored by the two pipelines")
-    texts = {}
-    cols = st.columns(2)
-    for i, code in enumerate(("EUR", "GBP", "HKD", "INR")):
-        with cols[i % 2]:
-            texts[code] = st.text_area(f"{code} headline", SAMPLE_HEADLINES[code], height=90)
+# --- Live market anchoring -------------------------------------------------
+with st.spinner("Fetching live market data ..."):
+    histories, errors = {}, []
+    for pair in selected_pairs:
+        try:
+            histories[pair] = load_fx_history(FX_PAIRS[pair])
+        except Exception as exc:
+            errors.append(f"{pair}: {exc}")
+    vol_vals = load_vol_indices()
 
-    if st.button("Build 7-day projection", type="primary"):
-        signals = {}
-        score_rows = []
-        for code, text in texts.items():
-            direction, d_score = score_headline(direction_pipe, text)
-            event, e_score = score_headline(event_pipe, text)
-            signals[code] = {"direction": direction, "confidence": d_score, "event": event}
-            score_rows.append(
-                {
-                    "Currency": code,
-                    "Direction": direction,
-                    "Direction confidence": round(d_score, 4),
-                    "Event": event,
-                    "Event confidence": round(e_score, 4),
-                }
-            )
-        spots, drifts, anchor_note = fetch_market_anchor(5)
-        vol = fetch_vol_indices()
-        forecast = project_seven_days(spots, drifts, signals, vol, esi=esi)
-        advice = recommend(forecast, side=side)
+for e in errors:
+    st.error("Failed to load " + e)
+if not histories:
+    st.stop()
 
-        st.info(anchor_note)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("VIX", f"{vol['VIX']:.2f}", f"{vol['VIX'] - 20:.2f} vs 20")
-        m2.metric("V2TX", f"{vol['V2TX']:.2f}", f"{vol['V2TX'] - 20:.2f} vs 20")
-        m3.metric("VFTSE", f"{vol['VFTSE']:.2f}", f"{vol['VFTSE'] - 20:.2f} vs 20")
-        m4.metric("ESI input", f"{esi:.1f}", f"{esi - 100:.1f} vs 100")
+st.subheader("Market snapshot - last 5 daily closes")
+snapshot = pd.DataFrame({p: h.tail(5) for p, h in histories.items()}).round(4)
+st.dataframe(snapshot, use_container_width=True)
 
-        st.subheader("Pipeline scores")
-        st.dataframe(pd.DataFrame(score_rows), use_container_width=True)
-        st.subheader("7-day quotes")
-        show_cols = ["Date", "Weekday", "HKD/USD", "INR/USD", "GBP/USD", "EUR/USD"]
-        st.dataframe(forecast[show_cols], use_container_width=True)
-        st.subheader("Best day and day to avoid")
-        st.dataframe(advice, use_container_width=True)
-        st.caption(
-            "Day 2 onward applies a 0.2% event shock to EUR, GBP and INR only when Pipeline B "
-            "is not no_macro_event. HKD drift is damped for the peg. NaNs are forward-filled, then replaced with 0."
-        )
+vol_display = {t: (f"{v:.2f}" if v is not None else "n/a") for t, v in vol_vals.items()}
+st.caption("Volatility indices (baseline): " +
+           ", ".join(f"{t} = {v} ({VOL_BENCHMARKS[t]:.0f})" for t, v in vol_display.items()) +
+           f"  |  ESI = {esi:.1f} (100)")
 
+# --- Forecast ---------------------------------------------------------------
+forecaster = load_forecaster()
+sentiment_clf = load_sentiment_model(sentiment_id)
+summarizer = load_summary_model(summary_id)
 
-if __name__ == "__main__":
-    main()
+projections, sentiments, briefings, headline_rows = {}, {}, {}, {}
+with st.spinner("Running forecast + news analysis ..."):
+    for pair in histories:
+        median, p10, p90 = chronos_forecast(forecaster, histories[pair])
+        headlines = fetch_headlines(NEWS_QUERIES[pair], n_headlines)
+        score, counts, rows = score_headlines(sentiment_clf, headlines)
+        sentiments[pair] = (score, counts)
+        headline_rows[pair] = rows
+        briefings[pair] = generate_briefing(summarizer, headlines)
+        vol_adj = compute_daily_vol_adjustment(pair, vol_vals, esi)
+        projections[pair] = build_projection(histories[pair], median, p10, p90,
+                                             score, vol_adj, pair, event_on, weekend_fee_on)
 
+# --- Per-pair dashboards -----------------------------------------------------
+import plotly.graph_objects as go
+
+tabs = st.tabs(selected_pairs)
+for tab, pair in zip(tabs, selected_pairs):
+    with tab:
+        proj, hist = projections[pair], histories[pair]
+        score, counts = sentiments[pair]
+        spot = float(hist.iloc[-1])
+        end_rate = float(proj[pair].iloc[-1])
+        best, avoid = recommend_days(proj, pair, direction)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Spot", f"{spot:.4f}")
+        c2.metric("7-day projection", f"{end_rate:.4f}", f"{(end_rate / spot - 1) * 100:+.2f}%")
+        c3.metric("Best execution day", str(best["Date"]), f"{best[pair]:.4f}")
+        c4.metric("Day to avoid", str(avoid["Date"]), f"{avoid[pair]:.4f}")
+        st.caption("Weekends are excluded from the recommendation because of the 0.5% fee. "
+                   f"News sentiment score: {score:+.3f} "
+                   f"(+ = {counts['POSITIVE']} pos / {counts['NEUTRAL']} neu / {counts['NEGATIVE']} neg)")
+
+        # Chart: recent history + forecast with P10-P90 band.
+        hist_view = hist.tail(30)
+        xs = [hist_view.index[-1]] + pd.to_datetime(proj["Date"]).tolist()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=hist_view.index, y=hist_view.values,
+                                 name="History", line=dict(color="#9aa0a6")))
+        fig.add_trace(go.Scatter(
+            x=xs + xs[::-1],
+            y=[spot] + proj["High (P90)"].tolist() + [spot] + proj["Low (P10)"].tolist()[::-1],
+            fill="toself", fillcolor="rgba(31,119,180,0.15)",
+            line=dict(width=0), name="P10-P90 band", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=xs, y=[spot] + proj[pair].tolist(),
+                                 name="Forecast", line=dict(color="#1f77b4", width=3)))
+        fig.update_layout(title=f"{pair} - last 30 days + 7-day projection",
+                          yaxis_title=pair, height=420, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Daily executive briefing (fine-tuned T5-small)")
+        st.info(briefings[pair])
+
+        with st.expander("Projection table"):
+            st.dataframe(proj, use_container_width=True, hide_index=True)
+        with st.expander("News sentiment details"):
+            st.dataframe(pd.DataFrame(headline_rows[pair]),
+                         use_container_width=True, hide_index=True)
+
+# --- Combined projection matrix ---------------------------------------------
+st.subheader("Combined 7-day projection matrix")
+combined = projections[selected_pairs[0]][["Date", selected_pairs[0]]]
+for pair in selected_pairs[1:]:
+    combined = combined.merge(projections[pair][["Date", pair]], on="Date", how="outer")
+combined = combined.sort_values("Date").ffill().round(4)   # NaN safety
+st.dataframe(combined, use_container_width=True, hide_index=True)
+st.download_button("Download projection (CSV)", combined.to_csv(index=False),
+                   "fx_projection_7d.csv", "text/csv")
+
+if gs_enable:
+    if not gs_url:
+        st.warning("Enter a Google Sheet URL in the sidebar first.")
+    else:
+        try:
+            upload_to_gsheet(combined, gs_url, gs_tab)
+            st.success(f"Projection uploaded to tab '{gs_tab}'.")
+        except Exception as exc:
+            st.error("Google Sheets upload failed. Check st.secrets['gcp_service_account'] "
+                     f"and that the sheet is shared with the service account. Details: {exc}")
+
+st.caption("Models: " + sentiment_id + " | " + summary_id + " | " + CHRONOS_MODEL_ID +
+           ". Educational project - not investment advice.")
