@@ -27,7 +27,7 @@ import streamlit as st
 # notebooks), replace the two ids below. Course rule: the models used here must be
 # exactly the models produced by your notebooks.
 SENTIMENT_MODEL_ID = "chena2339/finbert-fx-sentiment"   # Student A - Model 1
-SUMMARY_MODEL_ID   = "chena2339/t5-fx-briefing"         # Student B - Model 2
+SUMMARY_MODEL_ID   = "sshleifer/distilbart-cnn-12-6"  # Pretrained winner from Experiments.ipynb (update if a different model wins)
 CHRONOS_MODEL_ID   = "amazon/chronos-bolt-small"              # pre-trained, NOT fine-tuned
 
 FX_PAIRS = {
@@ -83,38 +83,46 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
     except Exception:
         pass
 
-    # 2. Secondary Source: Free Frankfurter Historical API (No API key required)
-    try:
-        # e.g., ticker "EURUSD=X" -> base="EUR", quote="USD"
-        base_curr = ticker[:3]
-        quote_curr = ticker[3:6]
-        
-        # Fetch last 30 days of real daily historical rates
-        url = f"https://api.frankfurter.app/latest?amount=1&from={base_curr}&to={quote_curr}"
-        # For full history window:
-        start_date = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
-        url_hist = f"https://api.frankfurter.app/{start_date}..?from={base_curr}&to={quote_curr}"
-        
-        resp = requests.get(url_hist, timeout=5).json()
-        rates = resp.get("rates", {})
-        if rates:
-            data = {pd.to_datetime(dt): val[quote_curr] for dt, val in rates.items()}
-            s = pd.Series(data).sort_index()
-            if len(s) > 0:
-                return s
-    except Exception:
-        pass
+    # Fallbacks 2 and 3 only make sense for real FX pairs. Volatility indices
+    # (e.g. "^VIX") have no Frankfurter/static equivalent - returning a constant
+    # series there would silently corrupt the volatility adjustment, so we
+    # return empty instead and let load_vol_indices() record None.
+    is_fx_ticker = ticker in FX_PAIRS.values()
 
-    # 3. Final Fallback: Static baseline defaults
-    defaults = {
-        "EURUSD=X": 1.0850,
-        "GBPUSD=X": 1.2700,
-        "HKDUSD=X": 0.1280,
-        "INRUSD=X": 0.0120,
-    }
-    base_price = defaults.get(ticker, 1.0000)
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=90, freq="D")
-    return pd.Series(base_price, index=dates)
+    # 2. Secondary Source: Free Frankfurter Historical API (No API key required)
+    if is_fx_ticker:
+        try:
+            # e.g., ticker "EURUSD=X" -> base="EUR", quote="USD"
+            base_curr = ticker[:3]
+            quote_curr = ticker[3:6]
+
+            # Historical range endpoint: ECB reference rates, business days only
+            start_date = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
+            url_hist = f"https://api.frankfurter.app/{start_date}..?from={base_curr}&to={quote_curr}"
+
+            resp = requests.get(url_hist, timeout=5).json()
+            rates = resp.get("rates", {})
+            if rates:
+                data = {pd.to_datetime(dt): val[quote_curr] for dt, val in rates.items()}
+                s = pd.Series(data).sort_index()
+                if len(s) > 0:
+                    return s
+        except Exception:
+            pass
+
+    # 3. Final Fallback: Static baseline defaults (FX pairs only)
+    if is_fx_ticker:
+        defaults = {
+            "EURUSD=X": 1.0850,
+            "GBPUSD=X": 1.2700,
+            "HKDUSD=X": 0.1280,
+            "INRUSD=X": 0.0120,
+        }
+        base_price = defaults[ticker]
+        dates = pd.date_range(end=pd.Timestamp.now(), periods=90, freq="D")
+        return pd.Series(base_price, index=dates)
+
+    return pd.Series(dtype=float)   # non-FX ticker with yfinance down -> no data
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_vol_indices() -> dict:
@@ -230,7 +238,9 @@ def generate_briefing(summarizer, headlines: list, max_items: int = 8) -> str:
     if not headlines:
         return "No headlines available."
     text = " ".join(headlines[:max_items])[:3000]        # stay inside the 512-token window
-    return summarizer(text, max_length=64, min_length=15)[0]["summary_text"]
+    # max_new_tokens (not max_length): pipelines set max_new_tokens=256 by default,
+    # which silently overrides max_length and would produce over-long briefings.
+    return summarizer(text, max_new_tokens=64, min_length=15, truncation=True)[0]["summary_text"]
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +387,12 @@ if not histories:
 
 st.subheader("Market snapshot - last 5 daily closes")
 
-# Extract the latest 5 daily closes and align them by date
+# Extract the latest 5 daily closes for the SELECTED pairs, aligned by date
 history_data = {}
-for pair, ticker in FX_PAIRS.items():
-    s = load_fx_history(ticker, period="10d")
+for pair in selected_pairs:
+    s = load_fx_history(FX_PAIRS[pair], period="10d")
+    if s.empty:
+        continue
     # Convert index to date-only to fix outer-join issues caused by time components
     s.index = s.index.date
     # Deduplicate keeping the last price per day, then select the latest 5 trading days
