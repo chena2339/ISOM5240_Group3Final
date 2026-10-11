@@ -318,27 +318,6 @@ def recommend_days(proj: pd.DataFrame, pair: str, direction: str):
 
 
 
-def fetch_article_text(url: str) -> str:
-    """Download a news URL and extract the plain article text.
-
-    Uses trafilatura when installed; falls back to a simple HTML tag strip.
-    """
-    try:
-        import trafilatura
-        html = trafilatura.fetch_url(url)
-        if html:
-            text = trafilatura.extract(html)
-            if text:
-                return text.strip()
-    except Exception:
-        pass
-    import re
-    import requests
-    html = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}).text
-    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
-    text = re.sub(r"(?s)<[^>]+>", " ", html)
-    return re.sub(r"\s+", " ", text).strip()
-
 def upload_to_gsheet(df: pd.DataFrame, sheet_url: str, tab: str):
     """Upload the projection matrix to a Google Sheet tab.
 
@@ -363,6 +342,9 @@ st.caption("7-day dynamic FX projection for corporate cash-flow management - "
 
 with st.sidebar:
     st.header("Settings")
+    mode = st.radio("Mode", ["Live forecast", "Historical backtest"],
+                    help="Backtest mode: re-forecast 7 days from a past date T using only "
+                         "data up to T, then compare with the actual rates.")
     sentiment_id = st.text_input("Sentiment model id (Hugging Face)", SENTIMENT_MODEL_ID)
     summary_id = st.text_input("Briefing model id (Hugging Face)", SUMMARY_MODEL_ID)
     selected_pairs = st.multiselect("Currency pairs", list(FX_PAIRS),
@@ -387,6 +369,100 @@ with st.sidebar:
 if not selected_pairs:
     st.warning("Select at least one currency pair in the sidebar.")
     st.stop()
+
+
+# ============================ HISTORICAL BACKTEST MODE =======================
+# Sample test of the Chronos-Bolt forecaster's historical accuracy.
+if mode == "Historical backtest":
+    import datetime as _dt
+    import plotly.graph_objects as go
+
+    st.subheader("Historical backtest - Chronos-Bolt accuracy sample test")
+    st.info("Backtest mode uses NEUTRAL macro fallbacks: news sentiment = 0.0 and "
+            "volatility indices pinned to their baselines (^VIX 20, ^V2TX 20, "
+            "^VFTSE 15, ESI 100), because historical news / index snapshots cannot "
+            "be retrieved. The event spike and weekend fee are switched off, so the "
+            "table below isolates the raw forecasting model's accuracy.")
+
+    bt_pairs = st.multiselect("Currency pairs to backtest", list(FX_PAIRS),
+                              default=["EUR/USD", "GBP/USD"], key="bt_pairs")
+    bt_date = st.date_input("Backtest start date (T)",
+                            value=_dt.date.today() - _dt.timedelta(days=14),
+                            key="bt_date")
+    st.caption("The model sees ONLY data up to T; days T+1..T+7 are forecast and "
+               "then compared with the actual rates.")
+
+    if st.button("Run backtest") and bt_pairs:
+        forecaster_bt = load_forecaster()   # Chronos only - no NLP models needed
+        tabs = st.tabs(bt_pairs)
+        for tab, pair in zip(tabs, bt_pairs):
+            with tab:
+                full_hist = load_fx_history(FX_PAIRS[pair], period="1y")
+                if full_hist is None or len(full_hist) == 0:
+                    st.error(f"No historical data for {pair}.")
+                    continue
+                idx = pd.to_datetime(full_hist.index).tz_localize(None)
+                T = pd.Timestamp(bt_date)
+                # Truncate at T: the model input must not peek beyond T.
+                history_t = full_hist[idx <= T]
+                actual_7d = full_hist[idx > T].head(FORECAST_DAYS)
+                if len(history_t) < 60:
+                    st.warning("Need >= 60 trading days before T - pick a later date.")
+                    continue
+                if len(actual_7d) == 0:
+                    st.warning("No actual data after T yet - pick an earlier date.")
+                    continue
+
+                median, p10, p90 = chronos_forecast(forecaster_bt, history_t)
+                # Neutral degradation: sentiment 0.0, vol adjustment 0.0,
+                # no event spike, no weekend fee -> pure model forecast.
+                proj_bt = build_projection(history_t, median, p10, p90,
+                                           sentiment_score=0.0, daily_vol_adj=0.0,
+                                           pair=pair, event_on=False, weekend_fee_on=False)
+
+                n = min(len(actual_7d), FORECAST_DAYS)
+                bt_df = pd.DataFrame({
+                    "Date": pd.to_datetime(actual_7d.index[:n]).strftime("%Y-%m-%d"),
+                    "Predicted Rate": np.round(median[:n], 4),
+                    "Actual Rate": np.round(actual_7d.values[:n], 4),
+                })
+                bt_df["Absolute Error"] = np.round(
+                    np.abs(bt_df["Predicted Rate"] - bt_df["Actual Rate"]), 4)
+                mae = float(bt_df["Absolute Error"].mean())
+                mape = float(np.mean(np.abs((bt_df["Predicted Rate"] - bt_df["Actual Rate"])
+                                            / bt_df["Actual Rate"])) * 100)
+                m1, m2 = st.columns(2)
+                m1.metric(f"{pair} MAE (7d)", f"{mae:.4f}")
+                m2.metric(f"{pair} MAPE (7d)", f"{mape:.2f}%")
+
+                # Plotly: history tail + forecast (P10-P90 shaded band) + actual.
+                hist_tail = history_t.tail(60)
+                fc_dates = pd.to_datetime(
+                    pd.date_range(history_t.index[-1] + pd.Timedelta(days=1),
+                                  periods=FORECAST_DAYS, freq="D"))
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=hist_tail.index, y=hist_tail.values,
+                                         mode="lines", name="History (<= T)",
+                                         line=dict(color="#1f77b4")))
+                fig.add_trace(go.Scatter(x=fc_dates, y=p90, mode="lines",
+                                         line=dict(width=0), showlegend=False,
+                                         hoverinfo="skip"))
+                fig.add_trace(go.Scatter(x=fc_dates, y=p10, mode="lines",
+                                         fill="tonexty", fillcolor="rgba(255,127,14,0.2)",
+                                         line=dict(width=0), name="P10-P90 band",
+                                         hoverinfo="skip"))
+                fig.add_trace(go.Scatter(x=fc_dates, y=median, mode="lines+markers",
+                                         name="Forecast (median)",
+                                         line=dict(color="#ff7f0e", dash="dash")))
+                fig.add_trace(go.Scatter(x=pd.to_datetime(actual_7d.index),
+                                         y=actual_7d.values, mode="lines+markers",
+                                         name="Actual", line=dict(color="#2ca02c")))
+                fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+                                  yaxis_title=pair, legend=dict(orientation="h"))
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.dataframe(bt_df, use_container_width=True, hide_index=True)
+    st.stop()   # backtest mode ends here - live forecast below is untouched
 
 for label, mid in [("Sentiment", sentiment_id), ("Briefing", summary_id)]:
     if "your-username" in mid:
@@ -522,34 +598,6 @@ if gs_enable:
             st.error("Google Sheets upload failed. Check st.secrets['gcp_service_account'] "
                      f"and that the sheet is shared with the service account. Details: {exc}")
 
-
-# --- Test the models with your own news --------------------------------------
-st.subheader("Test the models with your own news")
-st.write("Paste a news headline/article or a link - the app runs the SAME fine-tuned "
-         "sentiment pipeline used for the projections on your input.")
-custom_url = st.text_input("News URL (optional)")
-custom_text = st.text_area("... or paste news text directly", height=120,
-                           placeholder="e.g., ECB signals rate cuts as eurozone inflation cools ...")
-also_summarize = st.checkbox("Also generate a briefing with the summarization pipeline", value=False)
-if st.button("Analyze news"):
-    user_text = custom_text.strip()
-    if not user_text and custom_url.strip():
-        with st.spinner("Fetching article ..."):
-            try:
-                user_text = fetch_article_text(custom_url.strip())
-            except Exception as exc:
-                st.error(f"Could not fetch the URL: {exc}")
-    if not user_text:
-        st.warning("Please paste some news text or provide a URL above.")
-    else:
-        result = sentiment_clf(user_text[:2000])[0]   # same pipeline as the projections
-        st.metric("Predicted sentiment", result["label"], f"confidence {result['score']:.1%}")
-        st.caption("Analyzed text (first 300 chars): " + user_text[:300])
-        if also_summarize:
-            with st.spinner("Summarizing ..."):
-                brief_pipe = load_summary_model(summary_id)
-                out = brief_pipe(user_text[:3000], max_new_tokens=64, min_length=15, truncation=True)
-                st.info("Briefing: " + out[0]["summary_text"])
 
 st.caption("Models: " + sentiment_id + " | " + summary_id + " | " + CHRONOS_MODEL_ID +
            ". Educational project - not investment advice.")
