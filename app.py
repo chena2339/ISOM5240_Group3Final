@@ -89,6 +89,9 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
     # return empty instead and let load_vol_indices() record None.
     is_fx_ticker = ticker in FX_PAIRS.values()
 
+    # Honour the requested period in the fallbacks too (backtest asks for "5y").
+    n_days = {"6mo": 183, "1y": 366, "2y": 731, "5y": 1827, "max": 7300}.get(period, 183)
+
     # 2. Secondary Source: Free Frankfurter Historical API (No API key required)
     if is_fx_ticker:
         try:
@@ -97,7 +100,8 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
             quote_curr = ticker[3:6]
 
             # Historical range endpoint: ECB reference rates, business days only
-            start_date = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime('%Y-%m-%d')
+            # (Frankfurter covers EUR from 1999, so 5 years is fine)
+            start_date = (pd.Timestamp.now() - pd.Timedelta(days=n_days)).strftime('%Y-%m-%d')
             url_hist = f"https://api.frankfurter.app/{start_date}..?from={base_curr}&to={quote_curr}"
 
             resp = requests.get(url_hist, timeout=5).json()
@@ -119,7 +123,7 @@ def load_fx_history(ticker: str, period: str = "6mo") -> pd.Series:
             "INRUSD=X": 0.0120,
         }
         base_price = defaults[ticker]
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=90, freq="D")
+        dates = pd.date_range(end=pd.Timestamp.now(), periods=n_days, freq="D")
         return pd.Series(base_price, index=dates)
 
     return pd.Series(dtype=float)   # non-FX ticker with yfinance down -> no data
