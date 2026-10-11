@@ -397,7 +397,7 @@ if mode == "Historical backtest":
         tabs = st.tabs(bt_pairs)
         for tab, pair in zip(tabs, bt_pairs):
             with tab:
-                full_hist = load_fx_history(FX_PAIRS[pair], period="1y")
+                full_hist = load_fx_history(FX_PAIRS[pair], period="5y")
                 if full_hist is None or len(full_hist) == 0:
                     st.error(f"No historical data for {pair}.")
                     continue
@@ -406,8 +406,10 @@ if mode == "Historical backtest":
                 # Truncate at T: the model input must not peek beyond T.
                 history_t = full_hist[idx <= T]
                 actual_7d = full_hist[idx > T].head(FORECAST_DAYS)
-                if len(history_t) < 60:
-                    st.warning("Need >= 60 trading days before T - pick a later date.")
+                # Chronos-Bolt pads contexts shorter than 32 days internally,
+                # so 32 trading days is the true minimum for a meaningful forecast.
+                if len(history_t) < 32:
+                    st.warning("Need >= 32 trading days before T - pick a later date.")
                     continue
                 if len(actual_7d) == 0:
                     st.warning("No actual data after T yet - pick an earlier date.")
