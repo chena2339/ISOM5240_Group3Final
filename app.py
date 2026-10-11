@@ -317,6 +317,28 @@ def recommend_days(proj: pd.DataFrame, pair: str, direction: str):
             tradable.loc[tradable[pair].idxmin()])
 
 
+
+def fetch_article_text(url: str) -> str:
+    """Download a news URL and extract the plain article text.
+
+    Uses trafilatura when installed; falls back to a simple HTML tag strip.
+    """
+    try:
+        import trafilatura
+        html = trafilatura.fetch_url(url)
+        if html:
+            text = trafilatura.extract(html)
+            if text:
+                return text.strip()
+    except Exception:
+        pass
+    import re
+    import requests
+    html = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}).text
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", text).strip()
+
 def upload_to_gsheet(df: pd.DataFrame, sheet_url: str, tab: str):
     """Upload the projection matrix to a Google Sheet tab.
 
@@ -492,6 +514,35 @@ if gs_enable:
         except Exception as exc:
             st.error("Google Sheets upload failed. Check st.secrets['gcp_service_account'] "
                      f"and that the sheet is shared with the service account. Details: {exc}")
+
+
+# --- Test the models with your own news --------------------------------------
+st.subheader("Test the models with your own news")
+st.write("Paste a news headline/article or a link - the app runs the SAME fine-tuned "
+         "sentiment pipeline used for the projections on your input.")
+custom_url = st.text_input("News URL (optional)")
+custom_text = st.text_area("... or paste news text directly", height=120,
+                           placeholder="e.g., ECB signals rate cuts as eurozone inflation cools ...")
+also_summarize = st.checkbox("Also generate a briefing with the summarization pipeline", value=False)
+if st.button("Analyze news"):
+    user_text = custom_text.strip()
+    if not user_text and custom_url.strip():
+        with st.spinner("Fetching article ..."):
+            try:
+                user_text = fetch_article_text(custom_url.strip())
+            except Exception as exc:
+                st.error(f"Could not fetch the URL: {exc}")
+    if not user_text:
+        st.warning("Please paste some news text or provide a URL above.")
+    else:
+        result = sentiment_clf(user_text[:2000])[0]   # same pipeline as the projections
+        st.metric("Predicted sentiment", result["label"], f"confidence {result['score']:.1%}")
+        st.caption("Analyzed text (first 300 chars): " + user_text[:300])
+        if also_summarize:
+            with st.spinner("Summarizing ..."):
+                brief_pipe = load_summary_model(summary_id)
+                out = brief_pipe(user_text[:3000], max_new_tokens=64, min_length=15, truncation=True)
+                st.info("Briefing: " + out[0]["summary_text"])
 
 st.caption("Models: " + sentiment_id + " | " + summary_id + " | " + CHRONOS_MODEL_ID +
            ". Educational project - not investment advice.")
