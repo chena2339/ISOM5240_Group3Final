@@ -375,6 +375,9 @@ with st.sidebar:
     event_on = st.checkbox("Macro event risk next week (+0.2% vol from day 2)", value=True)
     weekend_fee_on = st.checkbox("Apply 0.5% weekend transaction fee", value=True)
     n_headlines = st.slider("Headlines per pair", 5, 20, 10)
+    briefing_on = st.checkbox("Generate executive briefings (loads the summarization "
+                              "model, needs ~1 GB RAM)", value=False,
+                              help="Keep off on Streamlit Cloud free tier to avoid 'Over capacity'.")
     st.divider()
     with st.expander("Google Sheets upload (optional)"):
         gs_enable = st.checkbox("Upload projection to Google Sheet", value=False)
@@ -432,7 +435,8 @@ st.caption("Volatility indices (baseline): " +
 # --- Forecast ---------------------------------------------------------------
 forecaster = load_forecaster()
 sentiment_clf = load_sentiment_model(sentiment_id)
-summarizer = load_summary_model(summary_id)
+# The summarization model is loaded lazily (only when briefings are requested)
+# to stay within the Streamlit Cloud free-tier memory limit.
 
 projections, sentiments, briefings, headline_rows = {}, {}, {}, {}
 with st.spinner("Running forecast + news analysis ..."):
@@ -442,7 +446,10 @@ with st.spinner("Running forecast + news analysis ..."):
         score, counts, rows = score_headlines(sentiment_clf, headlines)
         sentiments[pair] = (score, counts)
         headline_rows[pair] = rows
-        briefings[pair] = generate_briefing(summarizer, headlines)
+        if briefing_on:
+            briefings[pair] = generate_briefing(load_summary_model(summary_id), headlines)
+        else:
+            briefings[pair] = "(Briefing disabled - enable it in the sidebar.)"
         vol_adj = compute_daily_vol_adjustment(pair, vol_vals, esi)
         projections[pair] = build_projection(histories[pair], median, p10, p90,
                                              score, vol_adj, pair, event_on, weekend_fee_on)
