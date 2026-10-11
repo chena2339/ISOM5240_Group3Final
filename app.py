@@ -430,6 +430,10 @@ if mode == "Historical backtest":
                 })
                 bt_df["Absolute Error"] = np.round(
                     np.abs(bt_df["Predicted Rate"] - bt_df["Actual Rate"]), 4)
+                # Signed percentage error: (predicted - actual) / actual
+                bt_df["Error (%)"] = np.round(
+                    (bt_df["Predicted Rate"] - bt_df["Actual Rate"])
+                    / bt_df["Actual Rate"] * 100, 3)
                 mae = float(bt_df["Absolute Error"].mean())
                 mape = float(np.mean(np.abs((bt_df["Predicted Rate"] - bt_df["Actual Rate"])
                                             / bt_df["Actual Rate"])) * 100)
