@@ -27,7 +27,7 @@ import streamlit as st
 # notebooks), replace the two ids below. Course rule: the models used here must be
 # exactly the models produced by your notebooks.
 SENTIMENT_MODEL_ID = "chena2339/finbert-fx-sentiment"   # Student A - Model 1
-SUMMARY_MODEL_ID   = "sshleifer/distilbart-cnn-12-6"  # Pretrained winner from Pipeline2_Summarization_Selection_and_App_Test.ipynb (update if a different model wins)
+SUMMARY_MODEL_ID   = "google/flan-t5-small"          # Pretrained winner from Pipeline2 experiments (ROUGE-1 0.2856)
 CHRONOS_MODEL_ID   = "amazon/chronos-bolt-small"              # pre-trained, NOT fine-tuned
 
 FX_PAIRS = {
