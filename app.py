@@ -10,7 +10,7 @@ Business logic layers on top of the model forecast:
   - Live market anchoring  : latest 5 daily closes from yfinance
   - Volatility adjustment  : ^VIX (20), ^V2TX (20), ^VFTSE (15) and Eurozone ESI (100)
   - Macro event simulation : +0.2% volatility from day 2 for EUR, GBP, INR
-  - Weekend transaction fee: x0.995 on Saturday/Sunday projections (HSBC alignment)
+  - Weekend transaction fee: x0.995 on Saturday/Sunday projections (SF Express treasury assumption)
   - Execution advice       : best / worst day to convert, given the trade direction
 
 Run locally:  streamlit run app.py
@@ -298,7 +298,7 @@ def build_projection(history, median, p10, p90, sentiment_score, daily_vol_adj,
         low = p10[t] * (1 + cum_adj) * (1 - band_widen)
         high = p90[t] * (1 + cum_adj) * (1 + band_widen)
 
-        # 4) weekend transaction fee (HSBC alignment): 0.5% off on Sat/Sun
+        # 4) weekend transaction fee (SF Express treasury assumption): 0.5% off on Sat/Sun
         note = ""
         if weekend_fee_on and dates[t].weekday() >= 5:
             rate, low, high = rate * WEEKEND_FACTOR, low * WEEKEND_FACTOR, high * WEEKEND_FACTOR
